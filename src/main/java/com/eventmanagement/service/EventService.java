@@ -7,6 +7,7 @@ import com.eventmanagement.persistence.DataSnapshot;
 import com.eventmanagement.persistence.EventRepository;
 
 import java.io.IOException;
+import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -20,12 +21,20 @@ import java.util.regex.Pattern;
 public final class EventService {
 
     private static final Pattern EVENT_ID_PATTERN = Pattern.compile("EVT-(\\d+)");
+    private static final String REGISTRATION_PREFIX = "REG-";
+    private static final char[] REFERENCE_ALPHABET =
+            "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".toCharArray();
+    private static final int REFERENCE_LENGTH = 6;
+    private static final int MAX_REFERENCE_ATTEMPTS = 1_000;
 
     private static final Comparator<Event> EVENT_ORDER =
             Comparator.comparing(Event::start).thenComparing(Event::id);
+    private static final Comparator<Registration> REGISTRATION_ORDER =
+            Comparator.comparing(Registration::registeredAt).thenComparing(Registration::reference);
 
     private final EventRepository repository;
     private final Clock clock;
+    private final SecureRandom random = new SecureRandom();
 
     private List<Event> events;
     private List<Registration> registrations;
@@ -56,10 +65,39 @@ public final class EventService {
                 .findFirst();
     }
 
+    public List<Registration> registrationsFor(String eventId) {
+        return registrations.stream()
+                .filter(registration -> registration.eventId().equalsIgnoreCase(eventId))
+                .sorted(REGISTRATION_ORDER)
+                .toList();
+    }
+
+    public Optional<Registration> findRegistration(String eventId, String reference) {
+        if (eventId == null || reference == null) {
+            return Optional.empty();
+        }
+        String normalizedReference = reference.trim();
+        return registrations.stream()
+                .filter(registration -> registration.eventId().equalsIgnoreCase(eventId.trim()))
+                .filter(registration -> registration.reference().equalsIgnoreCase(normalizedReference))
+                .findFirst();
+    }
+
     public int registeredCount(Event event) {
         return (int) registrations.stream()
                 .filter(registration -> registration.eventId().equalsIgnoreCase(event.id()))
                 .count();
+    }
+
+    public int attendedCount(Event event) {
+        return (int) registrations.stream()
+                .filter(registration -> registration.eventId().equalsIgnoreCase(event.id()))
+                .filter(Registration::attended)
+                .count();
+    }
+
+    public int availablePlaces(Event event) {
+        return Math.max(0, event.capacity() - registeredCount(event));
     }
 
     public boolean isPast(Event event) {
@@ -127,6 +165,66 @@ public final class EventService {
         return updated;
     }
 
+    public Registration registerAttendee(String eventId, String attendeeName) {
+        Event event = requireEvent(eventId);
+        if (event.isCancelled()) {
+            throw new EventServiceException("This event has been cancelled and cannot accept registrations.");
+        }
+        if (isPast(event)) {
+            throw new EventServiceException("This event has already taken place and cannot accept registrations.");
+        }
+
+        int registered = registeredCount(event);
+        if (registered >= event.capacity()) {
+            throw new EventServiceException("This event has reached its capacity of "
+                    + event.capacity() + ". Further registrations are blocked.");
+        }
+
+        String cleanName = requireText(attendeeName, "Attendee name");
+        Registration registration = new Registration(
+                nextRegistrationReference(), event.id(), cleanName, now(), false);
+        List<Registration> updatedRegistrations = new ArrayList<>(registrations);
+        updatedRegistrations.add(registration);
+        commit(events, updatedRegistrations);
+        return registration;
+    }
+
+    public Registration cancelRegistration(String eventId, String reference) {
+        Event event = requireEvent(eventId);
+        Registration registration = requireRegistration(event, reference);
+        List<Registration> updatedRegistrations = new ArrayList<>(registrations);
+        updatedRegistrations.removeIf(existing ->
+                existing.reference().equalsIgnoreCase(registration.reference()));
+        commit(events, updatedRegistrations);
+        return registration;
+    }
+
+    public Registration markAttended(String eventId, String reference) {
+        Event event = requireEvent(eventId);
+        Registration registration = requireRegistration(event, reference);
+        if (registration.attended()) {
+            return registration;
+        }
+        Registration updated = registration.markAttended();
+        List<Registration> updatedRegistrations = registrations.stream()
+                .map(existing -> existing.reference().equalsIgnoreCase(updated.reference())
+                        ? updated
+                        : existing)
+                .toList();
+        commit(events, updatedRegistrations);
+        return updated;
+    }
+
+    private Registration requireRegistration(Event event, String reference) {
+        String normalized = reference == null ? "" : reference.trim();
+        return registrations.stream()
+                .filter(registration -> registration.eventId().equalsIgnoreCase(event.id()))
+                .filter(registration -> registration.reference().equalsIgnoreCase(normalized))
+                .findFirst()
+                .orElseThrow(() -> new EventServiceException(
+                        "No registration found with reference " + normalized + " for this event."));
+    }
+
     private Event requireEvent(String id) {
         return findEvent(id).orElseThrow(() -> new EventServiceException(
                 "No event found with ID " + (id == null ? "" : id.trim()) + "."));
@@ -185,5 +283,22 @@ public final class EventService {
             }
         }
         return String.format(Locale.ROOT, "EVT-%04d", highest + 1);
+    }
+
+    private String nextRegistrationReference() {
+        for (int attempt = 0; attempt < MAX_REFERENCE_ATTEMPTS; attempt++) {
+            StringBuilder candidate = new StringBuilder(REGISTRATION_PREFIX);
+            for (int index = 0; index < REFERENCE_LENGTH; index++) {
+                candidate.append(REFERENCE_ALPHABET[random.nextInt(REFERENCE_ALPHABET.length)]);
+            }
+            String reference = candidate.toString();
+            boolean alreadyUsed = registrations.stream()
+                    .anyMatch(registration -> registration.reference().equalsIgnoreCase(reference));
+            if (!alreadyUsed) {
+                return reference;
+            }
+        }
+        throw new EventServiceException(
+                "Could not generate a unique registration reference. Please try again.");
     }
 }
