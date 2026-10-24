@@ -23,6 +23,8 @@
 
 当前故事点：**30 / 43（约 69.8%）**；工作项：**9 / 12 完成**。
 
+每条 Jira 任务对应的代码位置和提交记录见 [Jira-to-code traceability](docs/jira-traceability.md)。
+
 ## 运行要求
 
 - Java 17 或更高版本（本机使用 Java 25 构建，产物目标版本为 17）
